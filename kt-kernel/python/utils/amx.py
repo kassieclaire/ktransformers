@@ -25,6 +25,7 @@ AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
 AMXInt4_KGroup_MOE = getattr(_moe_mod, "AMXInt4_KGroup_MOE", None)
 AMXFP4_KGroup_MOE = getattr(_moe_mod, "AMXFP4_KGroup_MOE", None)
+AMXFP4_KGroup_INT8_MOE = getattr(_moe_mod, "AMXFP4_KGroup_INT8_MOE", None)
 AMXMXFP8_KGroup_MOE = getattr(_moe_mod, "AMXMXFP8_KGroup_MOE", None)
 AMXFP8_MOE = getattr(_moe_mod, "AMXFP8_MOE", None)
 AMXBF16_MOE = getattr(_moe_mod, "AMXBF16_MOE", None)
@@ -42,6 +43,7 @@ _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
 _HAS_AMXINT8_SUPPORT = AMXInt8_MOE is not None
 _HAS_RAWINT4_SUPPORT = AMXInt4_KGroup_MOE is not None
 _HAS_MXFP4_SUPPORT = AMXFP4_KGroup_MOE is not None
+_HAS_MXFP4_INT8_SUPPORT = AMXFP4_KGroup_INT8_MOE is not None
 _HAS_MXFP8_SUPPORT = AMXMXFP8_KGroup_MOE is not None
 _HAS_FP8_SUPPORT = AMXFP8_MOE is not None
 _HAS_BF16_SUPPORT = AMXBF16_MOE is not None
@@ -153,10 +155,21 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
 def _select_mxfp4_backend():
     """Select MXFP4 backend: AMX/AVX-512 (preferred) > AVX2 (fallback).
 
-    Override with KT_MXFP4_BACKEND=avx2|amx.
+    Override with KT_MXFP4_BACKEND=avx2|amx|int8.
+    - amx:  FP4→BF16 decode + AVX-512 BF16 dot product (default, ~0% act error)
+    - int8: FP4→INT8 (×2 LUT) + VNNI INT8 dot product (~0.4% act error, faster)
+    - avx2: AVX2 fallback for non-AVX-512 CPUs
     Returns None if no MXFP4 backend is available.
     """
     forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
+
+    if forced == "int8":
+        if not _HAS_MXFP4_INT8_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=int8 requested, but AMXFP4_KGroup_INT8_MOE is not compiled in. "
+                "Recompile with AVX512F + AVX512BW + AVX512VNNI enabled."
+            )
+        return AMXFP4_KGroup_INT8_MOE
 
     if forced == "amx":
         if not _HAS_MXFP4_SUPPORT:

@@ -14,6 +14,9 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include "la/amx_buffers.hpp"      // BufferASmallKGroupImpl, BufferBInt4KGroupImpl, BufferCReduceImpl
+#include "la/amx_kernels.hpp"      // GemmKernel224Int4SmallKGroup (for constants/masks)
+#include "la/amx_quantization.hpp"  // _mm512_dpbssd_epi32 polyfill
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -345,6 +348,145 @@ inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
   GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+}
+
+}  // namespace amx
+
+// ============================================================================
+// MXFP4→INT8 kernel: FP4 E2M1 weights (×2 LUT → INT8) × INT8 activations
+// ============================================================================
+// Key insight: every FP4 E2M1 value × 2 is an exact integer in [-12, 12],
+// fitting in INT8 with zero precision loss. The weight scale is multiplied
+// by 0.5 at load time to compensate for the ×2.
+//
+// This kernel keeps 4-bit FP4 storage (nibble-packed) and decodes to INT8
+// on-the-fly via PSHUFB LUT, then uses _mm512_dpbssd_epi32 (VNNI INT8 dot
+// product) instead of _mm512_dpbf16_ps (BF16 dot product).
+//
+// Activations are quantized to INT8 (per k-group), same as GemmKernel224Int4SmallKGroup.
+// The ~0.4% error is entirely from activation quantization; the weight
+// conversion is lossless.
+namespace amx {
+
+struct GemmKernel224MXFP4Int8KGroup {
+  using dt = uint8_t;  // packed FP4 type (nibble-packed, same layout as INT4)
+  using output_t = int32_t;
+  static constexpr double ELEMENT_SIZE = 0.5;
+  static constexpr int VNNI_BLK = 4;
+
+  static constexpr int M_STEP = 1;
+  static constexpr int N_STEP = 32;
+  static constexpr int K_STEP = 32;
+
+  static inline const int N_BLOCK = 256;
+  static inline const int K_BLOCK = 7168;  // Will be overridden by k_group_size
+
+  static std::string name() { return "MXFP4_INT8_KGROUP"; }
+  static int recommended_nth(int n) { return (n + N_BLOCK - 1) / N_BLOCK; }
+  static std::pair<int, int> split_range_n(int n, int ith, int nth) {
+    int n_start = N_BLOCK * ith;
+    int n_end = std::min(n, N_BLOCK * (ith + 1));
+    return {n_start, n_end};
+  }
+  static void config() {}
+
+  // FP4 E2M1 nibble → INT8 (value × 2) LUT for PSHUFB
+  // Index:  0   1   2   3   4   5   6   7   8   9   A   B   C   D   E   F
+  // Value:  0   1   2   3   4   6   8  12   0  -1  -2  -3  -4  -6  -8 -12
+  alignas(16) static constexpr int8_t fp4_int8_lut[16] = {0, 1, 2, 3, 4, 6, 8, 12,
+                                                          0, -1, -2, -3, -4, -6, -8, -12};
+
+  // Convert 32 packed FP4 bytes (64 values = 2 k-groups) → 64 INT8 values (__m512i)
+  // Input: __m256i (32 bytes of packed FP4)
+  // Output: __m512i (64 INT8 values in sequential K order)
+  __attribute__((always_inline)) static inline __m512i mxfp4_to_int8_64(__m256i packed) {
+    __m128i lo_mask = _mm_set1_epi8(0x0F);
+
+    // Split into 4 nibble vectors (lo and hi of each 128-bit lane)
+    __m128i p0 = _mm256_castsi256_si128(packed);       // bytes 0..15
+    __m128i p1 = _mm256_extracti128_si256(packed, 1);  // bytes 16..31
+
+    __m128i lo0 = _mm_and_si128(p0, lo_mask);
+    __m128i hi0 = _mm_and_si128(_mm_srli_epi16(p0, 4), lo_mask);
+    __m128i lo1 = _mm_and_si128(p1, lo_mask);
+    __m128i hi1 = _mm_and_si128(_mm_srli_epi16(p1, 4), lo_mask);
+
+    __m128i lut = _mm_load_si128((const __m128i*)fp4_int8_lut);
+    __m128i lo0_i8 = _mm_shuffle_epi8(lut, lo0);
+    __m128i hi0_i8 = _mm_shuffle_epi8(lut, hi0);
+    __m128i lo1_i8 = _mm_shuffle_epi8(lut, lo1);
+    __m128i hi1_i8 = _mm_shuffle_epi8(lut, hi1);
+
+    // Interleave lo/hi to restore column order within each 128-bit chunk
+    __m128i r0 = _mm_unpacklo_epi8(lo0_i8, hi0_i8);  // cols  0..15
+    __m128i r1 = _mm_unpackhi_epi8(lo0_i8, hi0_i8);  // cols 16..31
+    __m128i r2 = _mm_unpacklo_epi8(lo1_i8, hi1_i8);  // cols 32..47
+    __m128i r3 = _mm_unpackhi_epi8(lo1_i8, hi1_i8);  // cols 48..63
+
+    // Combine into 512-bit
+    __m256i q0 = _mm256_inserti128_si256(_mm256_castsi128_si256(r0), r1, 1);
+    __m256i q1 = _mm256_inserti128_si256(_mm256_castsi128_si256(r2), r3, 1);
+    return _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
+  }
+
+  // Buffers: INT8 activations (BufferASmallKGroupImpl), FP4 nibble-packed weights
+  using BufferA = BufferASmallKGroupImpl<GemmKernel224MXFP4Int8KGroup>;
+  using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4Int8KGroup>;  // nibble-packed FP4 (same layout)
+  using BufferC = BufferCReduceImpl<GemmKernel224MXFP4Int8KGroup>;
+
+  // K-group aware AVX kernel for FP4→INT8 weights × INT8 activations
+  // Mirrors GemmKernel224Int4SmallKGroup::integer_mat_vec_kgroup but uses
+  // PSHUFB FP4→INT8 LUT instead of compressed_int4_to_int8_avx512.
+  static inline void integer_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb,
+                                            BufferC* bc, int ith, int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    for (int m_begin = 0; m_begin < m; m_begin++) {
+      float* c = bc->get_submat(m, n, m_begin, n_start);
+      __m512i* a512 = (__m512i*)ba->get_submat(m, k, m_begin, 0);
+
+      for (int n_block_begin = n_start; n_block_begin < n_end; n_block_begin++) {
+        // FP4 weights: 32 bytes per 64-element k-block (nibble-packed)
+        __m256i* b256 = (__m256i*)bb->get_submat(n, k, n_block_begin, 0);
+        float* as = (float*)ba->get_scale(m, m_begin, k, 0);
+        float* bs = (float*)bb->get_scale(n, n_block_begin, k, 0);
+
+        __m512 sum = _mm512_setzero_ps();
+#undef WORK_K_BLOCK
+#define WORK_K_BLOCK(k_block)                                                               \
+  {                                                                                         \
+    __m256 abscale0 = _mm256_set1_ps(as[(k_block) * 2] * bs[(k_block) * 2]);                \
+    __m256 abscale1 = _mm256_set1_ps(as[(k_block) * 2 + 1] * bs[(k_block) * 2 + 1]);        \
+    __m512 abscale = _mm512_insertf32x8(_mm512_castps256_ps512(abscale0), abscale1, 1);     \
+    __m512i mul = _mm512_setzero_si512();                                                   \
+    mul = _mm512_dpbssd_epi32(mul, a512[k_block], mxfp4_to_int8_64(b256[k_block]));         \
+    sum = _mm512_add_ps(sum, _mm512_mul_ps(abscale, _mm512_cvtepi32_ps(mul)));              \
+  }
+
+        for (int k_block = 0; k_block < k / 64; k_block += 2) {
+          WORK_K_BLOCK(k_block);
+          WORK_K_BLOCK(k_block + 1);
+        }
+
+        c[n_block_begin - n_start] = _mm512_reduce_add_ps(sum);
+#undef WORK_K_BLOCK
+      }
+    }
+  }
+};
+
+// Dispatch functions for the INT8 kernel
+inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferA> ba,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferB> bb,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferC> bc, int ith, int nth) {
+  GemmKernel224MXFP4Int8KGroup::integer_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+}
+
+inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferA> ba,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferB> bb,
+                           std::shared_ptr<GemmKernel224MXFP4Int8KGroup::BufferC> bc, int ith, int nth) {
+  GemmKernel224MXFP4Int8KGroup::integer_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
 }
 
 }  // namespace amx
@@ -805,6 +947,284 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
     this->weights_loaded = true;
   }
+
+  void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
+                                    const std::vector<uintptr_t>& w13_scale_ptrs,
+                                    const std::vector<uintptr_t>& w2_weight_ptrs,
+                                    const std::vector<uintptr_t>& w2_scale_ptrs) {
+    if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    if (w13_weight_ptrs.size() != gpu_tp_count || w13_scale_ptrs.size() != gpu_tp_count ||
+        w2_weight_ptrs.size() != gpu_tp_count || w2_scale_ptrs.size() != gpu_tp_count)
+      throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
+
+    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
+      this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
+                                            w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+    });
+  }
+};
+
+// ============================================================================
+// AMX_FP4_INT8_MOE_TP — CRTP class for FP4→INT8 kernel
+// Mirrors AMX_K2_MOE_TP structure (INT8 activations with k_group_size) but:
+//   - Loads FP4 nibble-packed weights (same memcpy as AMX_FP4_MOE_TP)
+//   - Applies scale × 0.5 at load time to compensate for FP4×2→INT8
+// ============================================================================
+template <class T = amx::GemmKernel224MXFP4Int8KGroup>
+class AMX_FP4_INT8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_INT8_MOE_TP<T>> {
+ protected:
+  using Base = AMX_MOE_BASE<T, AMX_FP4_INT8_MOE_TP<T>>;
+  using Base::config_;
+  using Base::down_ba_;
+  using Base::down_bb_;
+  using Base::down_bc_;
+  using Base::gate_bb_;
+  using Base::gate_bc_;
+  using Base::gate_up_ba_;
+  using Base::m_local_num_;
+  using Base::tp_part_idx;
+  using Base::up_bb_;
+  using Base::up_bc_;
+
+ public:
+  using typename Base::input_t;
+  using typename Base::output_t;
+
+  AMX_FP4_INT8_MOE_TP() = default;
+  AMX_FP4_INT8_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
+
+  void derived_init() {
+    auto& quant_config = config_.quant_config;
+    if (quant_config.group_size == 0 || quant_config.zero_point) {
+      throw std::runtime_error("MXFP4-INT8 MoE only supports KGroup FP4");
+    }
+    printf("Creating AMX_FP4_INT8_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+  }
+
+  ~AMX_FP4_INT8_MOE_TP() = default;
+
+  // BufferA: INT8 activations with k_group_size (like AMX_K2_MOE_TP)
+  size_t buffer_a_required_size_impl(size_t m, size_t k) const {
+    return T::BufferA::required_size(m, k, config_.quant_config.group_size);
+  }
+  size_t buffer_b_required_size_impl(size_t n, size_t k) const {
+    return T::BufferB::required_size(n, k, config_.quant_config.group_size);
+  }
+  size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
+
+  std::shared_ptr<typename T::BufferA> make_buffer_a_impl(size_t m, size_t k, void* data) const {
+    return std::make_shared<typename T::BufferA>(m, k, config_.quant_config.group_size, data);
+  }
+  std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
+    return std::make_shared<typename T::BufferB>(n, k, config_.quant_config.group_size, data);
+  }
+  std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
+    return std::make_shared<typename T::BufferC>(m, n, data);
+  }
+
+  void do_gate_up_gemm(bool do_up, int expert_idx, int ith, int nth, int qlen) {
+    auto& group_size = config_.quant_config.group_size;
+    int m = m_local_num_[expert_idx];
+    auto& ba = gate_up_ba_[expert_idx];
+    auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
+    auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
+
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    } else {
+      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+    }
+  }
+
+  void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
+    auto& group_size = config_.quant_config.group_size;
+    int m = m_local_num_[expert_idx];
+
+    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+      amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    } else {
+      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
+                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+    }
+  }
+
+  // Load FP4 weights (nibble-packed memcpy, same as AMX_FP4_MOE_TP) + scales × 0.5
+  void load_weights() {
+    auto& quant_config = config_.quant_config;
+    const uint64_t* physical_to_logical_map = (const uint64_t*)config_.physical_to_logical_map;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    if (quant_config.group_size == 0 || quant_config.zero_point)
+      throw std::runtime_error("MXFP4-INT8 MoE only support KGroup FP4.");
+    if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4-INT8 MoE only support load native weight.");
+
+    // Load FP4 weights (plain memcpy, same as BF16 path — FP4 is nibble-packed)
+    int nth = T::recommended_nth(config_.intermediate_size);
+    pool->do_work_stealing_job(
+        nth * config_.expert_num, nullptr,
+        [this, nth, physical_to_logical_map](int task_id) {
+          uint64_t expert_idx = task_id / nth;
+          uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+          int ith = task_id % nth;
+          gate_bb_[expert_idx]->from_raw_mat(
+              (uint8_t*)config_.gate_proj +
+                  ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
+              ith, nth);
+          up_bb_[expert_idx]->from_raw_mat(
+              (uint8_t*)config_.up_proj + ((logical_expert_id * config_.intermediate_size * config_.hidden_size) >> 1),
+              ith, nth);
+        },
+        nullptr);
+
+    nth = T::recommended_nth(config_.hidden_size);
+    pool->do_work_stealing_job(
+        nth * config_.expert_num, nullptr,
+        [this, nth, physical_to_logical_map](int task_id) {
+          uint64_t expert_idx = task_id / nth;
+          uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+          int ith = task_id % nth;
+          down_bb_[expert_idx]->from_raw_mat(
+              (uint8_t*)config_.down_proj +
+                  ((logical_expert_id * config_.hidden_size * config_.intermediate_size) >> 1),
+              ith, nth);
+        },
+        nullptr);
+
+    // Load scales: convert BF16→FP32 and multiply by 0.5 to compensate for FP4×2→INT8
+    // The ×0.5 is the ONLY difference from AMX_FP4_MOE_TP's scale loading.
+    pool->do_work_stealing_job(
+        config_.expert_num, nullptr,
+        [this, physical_to_logical_map](int task_id) {
+          uint64_t expert_idx = task_id;
+          uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+          size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
+
+          // convert_or_copy: BF16→FP32, then multiply by 0.5
+          convert_or_copy(gate_bb_[expert_idx]->d,
+                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          convert_or_copy(up_bb_[expert_idx]->d,
+                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          convert_or_copy(down_bb_[expert_idx]->d,
+                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+
+          // Apply ×0.5 to compensate for FP4×2→INT8 conversion
+          // In E8M0 this would be byte-1, but we already converted to FP32, so just multiply.
+          constexpr float half = 0.5f;
+          for (size_t i = 0; i < scale_elem_count; i++) {
+            gate_bb_[expert_idx]->d[i] *= half;
+            up_bb_[expert_idx]->d[i] *= half;
+            down_bb_[expert_idx]->d[i] *= half;
+          }
+        },
+        nullptr);
+  }
+
+  // Reuse the write_weights_to_buffer and fast_memcpy from AMX_FP4_MOE_TP
+  // (identical FP4 weight layout, scales converted back to BF16 with ×2 undo)
+  static inline void fast_memcpy(void* __restrict dst, const void* __restrict src, size_t bytes) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    size_t chunks = bytes / 64;
+    for (size_t i = 0; i < chunks; i++) {
+      __m512i data = _mm512_loadu_si512((__m512i*)s);
+      _mm512_storeu_si512((__m512i*)d, data);
+      d += 64;
+      s += 64;
+    }
+    if (bytes -= chunks * 64) std::memcpy(d, s, bytes);
+  }
+
+  static inline void fast_fp32_to_bf16(ggml_bf16_t* __restrict dst, const float* __restrict src, size_t count) {
+    size_t i = 0;
+    for (; i + 32 <= count; i += 32) {
+      __m512 v0 = _mm512_loadu_ps(src + i);
+      __m512 v1 = _mm512_loadu_ps(src + i + 16);
+      __m512i i0 = _mm512_srli_epi32(_mm512_castps_si512(v0), 16);
+      __m512i i1 = _mm512_srli_epi32(_mm512_castps_si512(v1), 16);
+      __m512i packed = _mm512_packus_epi32(i0, i1);
+      __m512i permuted = _mm512_permutexvar_epi64(_mm512_set_epi64(7, 5, 3, 1, 6, 4, 2, 0), packed);
+      _mm512_storeu_si512((__m512i*)(dst + i), permuted);
+    }
+    for (; i < count; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
+  }
+
+  void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
+                               const std::vector<uintptr_t>& w13_weight_ptrs,
+                               const std::vector<uintptr_t>& w13_scale_ptrs,
+                               const std::vector<uintptr_t>& w2_weight_ptrs,
+                               const std::vector<uintptr_t>& w2_scale_ptrs) const {
+    // Delegate to AMX_FP4_MOE_TP's implementation (identical FP4 weight layout)
+    // The scales stored internally are ×0.5, but when writing to GPU buffer we
+    // undo the ×0.5 (multiply by 2) since the GPU uses the original FP4 scale.
+    const int group_size = config_.quant_config.group_size;
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+
+    size_t cpu_tp_weight_elem_count = (size_t)config_.intermediate_size * config_.hidden_size;
+    size_t cpu_tp_weight_bytes = cpu_tp_weight_elem_count / 2;
+    size_t cpu_tp_scale_elem_count = cpu_tp_weight_elem_count / group_size;
+
+    size_t gpu_tp_weight_elem_count = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count;
+    size_t gpu_tp_weight_bytes = gpu_tp_weight_elem_count / 2;
+    size_t gpu_tp_scale_elem_count = gpu_tp_weight_elem_count / group_size;
+
+    // Simplified: copy weights (plain memcpy) and convert scales FP32→BF16 with ×2 undo
+    if (cpu_tp_count >= gpu_tp_count) {
+      int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+      int local_idx = tp_part_idx % (cpu_tp_count / gpu_tp_count);
+
+      uint8_t* w13_weight_dst = (uint8_t*)w13_weight_ptrs[target_gpu_tp];
+      ggml_bf16_t* w13_scale_dst = (ggml_bf16_t*)w13_scale_ptrs[target_gpu_tp];
+      uint8_t* w2_weight_dst = (uint8_t*)w2_weight_ptrs[target_gpu_tp];
+      ggml_bf16_t* w2_scale_dst = (ggml_bf16_t*)w2_scale_ptrs[target_gpu_tp];
+
+      size_t offset_in_gpu_weight = local_idx * cpu_tp_weight_bytes;
+      size_t offset_in_gpu_scale = local_idx * cpu_tp_scale_elem_count;
+
+      // Gate + Up weights (plain memcpy of nibble-packed FP4)
+      fast_memcpy(w13_weight_dst + offset_in_gpu_weight, gate_bb_[expert_id]->b, cpu_tp_weight_bytes);
+      fast_memcpy(w13_weight_dst + offset_in_gpu_weight + gpu_tp_weight_bytes, up_bb_[expert_id]->b,
+                  cpu_tp_weight_bytes);
+
+      // Down weights (column-major copy)
+      size_t weight_per_col = config_.intermediate_size >> 1;
+      size_t scale_per_col = config_.intermediate_size / group_size;
+      size_t gpu_weight_stride = (full_config.intermediate_size / gpu_tp_count) >> 1;
+      size_t gpu_scale_stride = (full_config.intermediate_size / gpu_tp_count) / group_size;
+      for (size_t col = 0; col < config_.hidden_size; col++) {
+        fast_memcpy(w2_weight_dst + col * gpu_weight_stride + local_idx * weight_per_col,
+                    (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
+      }
+
+      // Scales: undo ×0.5 (multiply by 2) when writing to GPU buffer
+      // The GPU uses original FP4 scales, not the halved INT8 scales
+      auto write_scales_undo_half = [](ggml_bf16_t* dst, const float* src, size_t count) {
+        // Create a temp buffer with ×2 applied, then convert to BF16
+        std::vector<float> tmp(count);
+        for (size_t i = 0; i < count; i++) tmp[i] = src[i] * 2.0f;
+        fast_fp32_to_bf16(dst, tmp.data(), count);
+      };
+
+      write_scales_undo_half(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+      write_scales_undo_half(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
+                             cpu_tp_scale_elem_count);
+      for (size_t col = 0; col < config_.hidden_size; col++) {
+        write_scales_undo_half(w2_scale_dst + col * gpu_scale_stride + local_idx * scale_per_col,
+                               down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
+      }
+    }
+  }
+};
+
+// ============================================================================
+// TP_MOE specialization for AMX_FP4_INT8_MOE_TP
+// ============================================================================
+template <typename K>
+class TP_MOE<AMX_FP4_INT8_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_INT8_MOE_TP<K>>> {
+ public:
+  using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_INT8_MOE_TP<K>>>;
+  using Base::Base;
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
