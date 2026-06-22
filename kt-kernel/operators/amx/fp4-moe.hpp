@@ -1220,11 +1220,141 @@ class AMX_FP4_INT8_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_INT8_MOE_TP<T>> {
 // ============================================================================
 // TP_MOE specialization for AMX_FP4_INT8_MOE_TP
 // ============================================================================
+// The weight loading (nibble-packed FP4 memcpy + BF16 scales) is identical to
+// AMX_FP4_MOE_TP. The derived class's load_weights() applies the ×0.5 scale
+// factor internally. We reuse the same TP-level load_weights() logic.
+// ============================================================================
 template <typename K>
 class TP_MOE<AMX_FP4_INT8_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_INT8_MOE_TP<K>>> {
  public:
   using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_INT8_MOE_TP<K>>>;
   using Base::Base;
+
+  // Override load_weights: identical FP4 weight layout as AMX_FP4_MOE_TP.
+  // Copies nibble-packed FP4 weights + BF16 scales into per-TP-part buffers,
+  // then calls each TP part's load_weights() which applies ×0.5 to scales.
+  void load_weights() override {
+    auto& config = this->config;
+    auto& tps = this->tps;
+    auto& tp_count = this->tp_count;
+    auto pool = config.pool;
+    const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
+
+    bool use_per_expert_ptrs = !config.gate_projs.empty();
+
+    if (config.gate_projs.empty() && config.gate_scale == nullptr)
+      throw std::runtime_error("MXFP4-INT8 MoE only supports Packed FP4 with KGroup Scale");
+
+    printf("From %s (INT8 path)\n", use_per_expert_ptrs ? "per-expert pointers (gate_projs)" : "Packed FP4 with KGroup Scale");
+
+    int& group_size = config.quant_config.group_size;
+
+    pool->dispense_backend()->do_numa_job([&, this](int i) {
+      auto& tpc = tps[i]->config_;
+      size_t weight_elem_count = tpc.intermediate_size * tpc.hidden_size;
+      size_t scales_elem_count = (tpc.hidden_size / group_size) * tpc.intermediate_size;
+
+      tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
+      tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+      tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+      tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+
+      if (use_per_expert_ptrs) {
+        pool->get_subpool(i)->do_work_stealing_job(
+            tpc.expert_num, nullptr,
+            [&, i](int expert_id_) {
+              size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+
+              uint8_t* src_gate = (uint8_t*)config.gate_projs[0][expert_id];
+              uint8_t* src_up = (uint8_t*)config.up_projs[0][expert_id];
+              uint8_t* src_down = (uint8_t*)config.down_projs[0][expert_id];
+              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
+              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
+              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+
+              memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
+                     src_gate + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
+              memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
+                     src_up + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
+              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                     src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
+              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                     src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
+
+              for (size_t col = 0; col < config.hidden_size; col++) {
+                memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                       src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
+                       (tpc.intermediate_size >> 1));
+                memcpy((ggml_bf16_t*)tpc.down_scale +
+                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                       src_down_scale +
+                           (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
+                       sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+              }
+            },
+            nullptr);
+      } else {
+        if (tpc.load == false) {
+          pool->get_subpool(i)->do_work_stealing_job(
+              tpc.expert_num, nullptr,
+              [&, i](int expert_id_) {
+                size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+
+                memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
+                       (uint8_t*)config.gate_proj +
+                           ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
+                       (weight_elem_count >> 1));
+                memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
+                       (uint8_t*)config.up_proj +
+                           ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
+                       (weight_elem_count >> 1));
+                memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                       (ggml_bf16_t*)config.gate_scale +
+                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                            i * scales_elem_count),
+                       sizeof(ggml_bf16_t) * scales_elem_count);
+                memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                       (ggml_bf16_t*)config.up_scale +
+                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                            i * scales_elem_count),
+                       sizeof(ggml_bf16_t) * scales_elem_count);
+
+                for (size_t col = 0; col < config.hidden_size; col++) {
+                  memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                         (uint8_t*)config.down_proj + ((expert_id * config.intermediate_size * config.hidden_size +
+                                                        col * config.intermediate_size + i * tpc.intermediate_size) >>
+                                                       1),
+                         (tpc.intermediate_size >> 1));
+                  memcpy((ggml_bf16_t*)tpc.down_scale +
+                             (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                         (ggml_bf16_t*)config.down_scale +
+                             ((expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
+                              col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
+                         sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
+                }
+              },
+              nullptr);
+        }
+      }
+      printf("TP %d load weight done (INT8).\n", i);
+    });
+
+    DO_TPS_LOAD_WEIGHTS(pool);
+
+    pool->dispense_backend()->do_numa_job([&, this](int i) {
+      auto& tpc = tps[i]->config_;
+      delete[] (uint8_t*)(tpc.gate_proj);
+      delete[] (uint8_t*)(tpc.up_proj);
+      delete[] (uint8_t*)(tpc.down_proj);
+      delete[] (ggml_bf16_t*)(tpc.gate_scale);
+      delete[] (ggml_bf16_t*)(tpc.up_scale);
+      delete[] (ggml_bf16_t*)(tpc.down_scale);
+    });
+
+    this->weights_loaded = true;
+  }
 
   void write_weight_scale_to_buffer(int gpu_tp_count, int expert_id, const std::vector<uintptr_t>& w13_weight_ptrs,
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
